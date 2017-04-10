@@ -1,0 +1,532 @@
+package org.xmclient;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.text.SimpleDateFormat;
+import java.util.Date;
+
+public class CmsClient {
+    private static final int STATE_AUTH = 0;
+    private static final int STATE_SESSION = 1;
+    private static final int STATE_CHANNEL = 2;
+    private static final int STATE_AUDIO = 3;
+    private static final int STATE_SYSTEM_FUNCTION = 4;
+    private static final int STATE_OP_TIME_SETTING = 5;
+    private static final int STATE_OP_MONITOR = 6;
+    private static final int STATE_H264DATA = 7;
+    private static final int STATE_SETSESSIONID = 8;
+    private static final int STATE_KEEP_ALIVE = 9;
+    private static final int STATE_STOP = -1;
+
+    byte[] TO_CAMERA = new byte[]{(byte) 0xff, 0, 0, 0}; //Frame header -> Camera
+    byte[] FROM_CAMERA = new byte[]{(byte) 0xff, 1, 0, 0}; //Frame header <- Camera
+
+    private static int currentState = STATE_AUTH;
+    private static byte[] sessionId = new byte[]{0, 0, 0, 0};
+    private static String sessionIdStr = "0x00000000";
+    private static String sessionIdStrSmall = "0x00";
+    private static int requestId = 0;
+
+    private ClientFSM client;
+    private Socket clientControlSocket;
+    private OutputStream clientControlOutput;
+    private InputStream clientControlInput;
+
+
+    public CmsClient(String ip, int port) {
+        client = new ClientFSM(ip, port);
+    }
+
+    public void kickoff() {
+        new Thread(client).start();
+    }
+
+    public void stop() {
+        currentState = STATE_STOP;
+    }
+
+    ;
+
+
+    private class ClientFSM implements Runnable {
+        String ip;
+        int port;
+
+        public ClientFSM(String ip, int port) {
+            this.ip = ip;
+            this.port = port;
+        }
+
+        @Override
+        public void run() {
+            StateAuth auth = new StateAuth(ip, port);
+            StateSession session = new StateSession();
+            StateChannel channel = new StateChannel();
+            StateAudio audio = new StateAudio();
+            StateSystemFunction systemFunction = new StateSystemFunction();
+            StateOPTimeSetting opTimeSetting = new StateOPTimeSetting();
+            StateOPMonitor opMonitor = new StateOPMonitor();
+            StateH264Data h264Data = new StateH264Data(ip, port);
+            StateSetSession setSession = new StateSetSession();
+            StateKeepAlive keepAlive = new StateKeepAlive();
+
+            boolean isFinished = false;
+            while (!isFinished) {
+
+                switch (currentState) {
+                    case STATE_AUTH:
+                        currentState = auth.go(currentState);
+                        break;
+                    case STATE_SESSION:
+                        currentState = session.go(currentState);
+                        break;
+                    case STATE_SETSESSIONID:
+                        currentState = setSession.go(currentState);
+                    case STATE_CHANNEL:
+                        currentState = channel.go(currentState);
+                        break;
+                    case STATE_AUDIO:
+                        currentState = audio.go(currentState);
+                        break;
+                    case STATE_SYSTEM_FUNCTION:
+                        currentState = systemFunction.go(currentState);
+                        break;
+                    case STATE_OP_TIME_SETTING:
+                        currentState = opTimeSetting.go(currentState);
+                        break;
+                    case STATE_OP_MONITOR:
+                        currentState = opMonitor.go(currentState);
+                        break;
+                    case STATE_H264DATA:
+                        currentState = h264Data.go(currentState);
+                        break;
+                    case STATE_KEEP_ALIVE:
+                        try {
+                            Thread.sleep(1800);
+                            currentState = keepAlive.go(currentState);
+                        } catch (InterruptedException e) {
+                            e.printStackTrace();
+                        }
+                        break;
+                    case STATE_STOP:
+                        isFinished = true;
+                        break;
+                }
+            }
+        }
+    }
+
+
+ 
+
+    private abstract class FSMState {
+        protected byte[] toCamera(String cmd, int command) {
+            byte buf[] = new byte[cmd.getBytes().length + 20];
+
+            System.arraycopy(TO_CAMERA, 0, buf, 0, 4);  //0xff 00 or 0xff 01
+            System.arraycopy(sessionId, 0, buf, 4, 4);  //session id
+            System.arraycopy(getByte4Via(requestId), 0, buf, 8, 4);  //request id
+            System.arraycopy(new byte[]{0, 0,}, 0, buf, 12, 2);  //reserved
+            System.arraycopy(getByte2Via(command), 0, buf, 14, 2);  //Command
+            System.arraycopy(getByte4Via(cmd.length()), 0, buf, 16, 4);  //payload length
+
+            System.arraycopy(cmd.getBytes(), 0, buf, 20, cmd.getBytes().length);
+
+            System.out.println("---> " + cmd);
+            return buf;
+        }
+
+        protected boolean isResponseValid(byte buf[], int len) {
+            if (len > 20) {
+                if (
+                        (getVal4By(buf, 0) == 0x01ff)  //FromCAMERA
+                    // && (getVal4By(buf, 8) == requestId) //same request id , Note: for start opmonitor this is not same
+                        ) {
+
+                    int command = getVal2By(buf, 14);
+                    int payloadLen = getVal4By(buf, 16);
+                    //if (payloadLen + 20 == len)   // If keepalive happen at same time then not equal, as no need to parser the return value so ignore
+                    {
+                        String response = new String(buf, 20, payloadLen);
+                        requestId++;
+                        System.out.println("<---" + response);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        int go(int initState) {
+            return STATE_STOP;
+        }
+    }
+
+    static int getVal4By(byte buf[], int pos) {
+        return (buf[pos] & 0xff) + (((buf[pos + 1] & 0xff) << 8) & 0xff00)
+                + (((buf[pos + 2] & 0xff) << 16) & 0xff0000)
+                + (((buf[pos + 3] & 0xff) << 24) & 0xff000000);
+    }
+
+    static int getVal2By(byte buf[], int pos) {
+        return (buf[pos] & 0xff) + (((buf[pos + 1] & 0xff) << 8) & 0xff00);
+    }
+
+
+    static byte[] getByte4Via(int val) {
+        return new byte[]{(byte) (val & 0xff), (byte) ((val & 0xff00) >> 8),
+                (byte) ((val & 0xff0000) >> 16), (byte) ((val & 0xff000000) >> 24)};
+    }
+
+    static byte[] getByte2Via(int val) {
+        return new byte[]{(byte) (val & 0xff), (byte) ((val & 0xff00) >> 8)};
+    }
+
+    private class StateAuth extends FSMState {
+        String ip;
+        int port;
+
+        public StateAuth(String ip, int port) {
+            this.ip = ip;
+            this.port = port;
+        }
+
+        @Override
+        int go(int initState) {
+            String cmd = "{ \"EncryptType\" : \"MD5\", \"LoginType\" : \"DVRIP-Web\", \"PassWord\" : \"tlJwpbo6\", \"UserName\" : \"admin\" }\n";
+
+            try {
+                clientControlSocket = new Socket(ip, port);
+                clientControlSocket.setSoTimeout(10000);
+                clientControlSocket.setKeepAlive(true);
+
+                clientControlOutput = clientControlSocket.getOutputStream();
+                clientControlInput = clientControlSocket.getInputStream();
+
+                clientControlOutput.write(toCamera(cmd, 1000)); //command auth 0x03E8
+                clientControlOutput.flush();
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+
+                if (isResponseValid(buf, len)) {
+
+                    //Save the sessionID
+                    System.arraycopy(buf, 4, sessionId, 0, 4);
+                    sessionIdStr = String.format("0x%02X%02X%02X%02X", sessionId[3], sessionId[2], sessionId[1], sessionId[0]);
+
+                    if (sessionId[1] == 0 && sessionId[2] == 0 &&sessionId[3] == 0)
+                        sessionIdStrSmall = String.format("0x%x", sessionId[0]);
+                    else if(sessionId[2] == 0 &&sessionId[3] == 0)
+                        sessionIdStrSmall = String.format("0x%x%x", sessionId[1], sessionId[0]);
+                    else if (sessionId[3] == 0){
+                        sessionIdStrSmall = String.format("0x%x%x%x", sessionId[2], sessionId[1], sessionId[0]);
+                    }else {
+                        sessionIdStrSmall = String.format("0x%x%x%x%x", sessionId[3], sessionId[2], sessionId[1], sessionId[0]);
+                    }
+                    return STATE_SESSION;
+                }
+
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    private class StateSession extends FSMState {
+        @Override
+        int go(int initState) {
+            String cmd = "{ \"Name\" : \"SystemInfo\", \"SessionID\" : \"" +
+                    sessionIdStr +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmd, 0x3FC)); //command session
+                clientControlOutput.flush();
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    return STATE_SETSESSIONID;
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+
+    private class StateSetSession extends FSMState {
+        @Override
+        int go(int initState) {
+            String cmd = "{ \"Name\" : \"\", \"SessionID\" : \"" +
+                    sessionIdStr +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmd, 0x5DC)); //command set session
+                clientControlOutput.flush();
+
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    return STATE_CHANNEL;
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    private class StateChannel extends FSMState {
+        @Override
+        int go(int initState) {
+            String cmd = "{ \"Name\" : \"ChannelTitle\", \"SessionID\" : \"" +
+                    sessionIdStr +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmd, 0x418)); //command Channel
+                clientControlOutput.flush();
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    return STATE_AUDIO;
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    private class StateAudio extends FSMState {
+        @Override
+        int go(int initState) {
+            String cmd = "{ \"Name\" : \"TalkAudioFormat\", \"SessionID\" : \"" +
+                    sessionIdStr +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmd, 0x550)); //command Audio
+                clientControlOutput.flush();
+
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    {
+                        return STATE_SYSTEM_FUNCTION;
+                    }
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+
+    private class StateKeepAlive extends FSMState {
+        @Override
+        int go(int initState) {
+            String cmdKeepAlive = "{ \"Name\" : \"KeepAlive\", \"SessionID\" : \"" +
+                    sessionIdStr +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmdKeepAlive, 0x03ee)); //command KeepAlive
+                clientControlOutput.flush();
+
+
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    {
+                        return STATE_KEEP_ALIVE;
+                    }
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    private class StateSystemFunction extends FSMState {
+        @Override
+        int go(int initState) {
+            String cmd = "{ \"Name\" : \"SystemFunction\", \"SessionID\" : \"" +
+                    sessionIdStr +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmd, 0x550)); //command SysFunction
+                clientControlOutput.flush();
+                byte buf[] = new byte[10000];
+                int len = clientControlInput.read(buf);
+
+                int payloadLength = getVal4By(buf, 16);
+                while (payloadLength > len) {
+                    len += clientControlInput.read(buf, len, 2000);
+                }
+
+                if (isResponseValid(buf, len)) {
+                    return STATE_OP_TIME_SETTING;
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    private class StateOPTimeSetting extends FSMState {
+        @Override
+        int go(int initState) {
+
+            SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss");
+            String cmd = "{ \"Name\" : \"OPTimeSetting\", \"OPTimeSetting\" : \"" +
+                    format.format(new Date()) +
+                    "\", \"SessionID\" : \"" +
+                    sessionIdStrSmall +
+                    "\" }\n";
+
+            try {
+                clientControlOutput.write(toCamera(cmd, 0x05aa)); //command Channel
+                clientControlOutput.flush();
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    return STATE_H264DATA;
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    private class StateOPMonitor extends FSMState {
+
+        @Override
+        int go(int initState) {
+
+            String cmd = "{ \"Name\" : \"OPMonitor\", \"OPMonitor\" : { \"Action\" : \"Start\", \"Parameter\" : { \"Channel\" : 0, \"CombinMode\" : \"NONE\", " +
+                    "\"StreamType\" : \"Main\", \"TransMode\" : \"TCP\" } }, \"SessionID\" : \"" +
+                    sessionIdStrSmall +
+                    "\" }\n";
+            requestId = 0;
+
+            try {
+                System.out.println(cmd);
+                clientControlOutput.write(toCamera(cmd, 0x0582)); //command Channel
+                clientControlOutput.flush();
+                byte buf[] = new byte[2000];
+                int len = clientControlInput.read(buf);
+
+                if (isResponseValid(buf, len)) {
+                    return STATE_KEEP_ALIVE;
+                }
+            } catch (Exception exp) {
+                exp.printStackTrace();
+            }
+            return STATE_AUTH;
+        }
+    }
+
+    static Socket socketAction;
+    static OutputStream outAction;
+    static InputStream inAction;
+
+    private class StateH264Data extends FSMState {
+        private String ip;
+        private int port;
+
+        public StateH264Data(String ip, int port) {
+            this.ip = ip;
+            this.port = port;
+        }
+
+        @Override
+        int go(int initState) {
+            String cmdClaim = "{ \"Name\" : \"OPMonitor\", \"OPMonitor\" : { \"Action\" : \"Claim\", \"Parameter\" : { \"Channel\" : 0, \"CombinMode\" : \"NONE\", \"StreamType\" : \"Main\", \"TransMode\" : \"TCP\" } }, \"SessionID\" : \"" +
+                    sessionIdStrSmall +
+                    "\" }\n";
+            requestId = 0;
+            try {
+                socketAction = new Socket(ip, port);
+                socketAction.setSoTimeout(10000);
+                socketAction.setKeepAlive(true);
+
+                outAction = socketAction.getOutputStream();
+                inAction = socketAction.getInputStream();
+
+                outAction.write(toCamera(cmdClaim, 0x0585)); //command auth
+                outAction.flush();
+                byte buf[] = new byte[2000];
+                int len = inAction.read(buf);
+                if (isResponseValid(buf, len)) {
+                    new Thread() {
+                        @Override
+                        public void run() {
+                            byte buf[] = new byte[20000];
+                            try {
+                                Thread.sleep(100);
+                                int frameLen;
+                                do {
+
+                                    frameLen = inAction.read(buf);
+                                    System.out.println("[rcv]"+frameLen);
+                                } while (frameLen > 0);
+                            } catch (Exception e) {
+                                e.printStackTrace();
+                                try {
+                                    inAction.close();
+                                } catch (IOException e1) {
+                                    e1.printStackTrace();
+                                }
+                                try {
+                                    outAction.close();
+                                } catch (IOException e1) {
+                                    e1.printStackTrace();
+                                }
+                                try {
+                                    socketAction.close();
+                                } catch (IOException e1) {
+                                    e1.printStackTrace();
+                                }
+
+                            }
+                            currentState = STATE_STOP;
+                        }
+                    }.start();
+                    return STATE_OP_MONITOR;
+                }
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+            return STATE_STOP;
+        }
+    }
+}
+
+   public static void main(String[] args) {
+        String ip = "192.168.1.10";
+        int port = 34567;
+
+        if (args.length > 0) ip = args[0];
+        if (args.length > 1) port = Integer.parseInt(args[1]);
+
+        CmsClient cms = new CmsClient(ip, port);
+        cms.kickoff();
+    }
